@@ -58,6 +58,9 @@ services:
     environment:
       API1_URL: http://api1:8000
       API2_URL: http://api2:8000
+      # the restart-recovery test re-runs the replica startup path
+      # (schema migrations) against the shared database
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/migration
     depends_on:
       api1:
         condition: service_healthy

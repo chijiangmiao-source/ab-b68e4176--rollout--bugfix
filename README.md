@@ -120,9 +120,12 @@ different parameters yields `409 IDEMPOTENCY_CONFLICT`.
    caller holds the current, unexpired epoch.  The command fixes
    `rollout_id`, `step`, `switch_id`, `plan_digest`, a strictly increasing
    per-device `device_generation` and a deterministic `command_id`
-   (uuid5 of `rollout_id:step:plan_digest`).  If the step already has a
-   command (lost response, restart, takeover), the original command is
-   returned unchanged — never a new id or generation.
+   (uuid5 of `rollout_id:step:plan_digest`).  The per-device generation
+   counter is permanent database state: it never resets, so acknowledged
+   commands, completed rollouts, idle periods and service restarts cannot
+   make a device see generation `1` (or any reused value) twice.  If the
+   step already has a command (lost response, restart, takeover), the
+   original command is returned unchanged — never a new id or generation.
 4. Switches poll `GET /switches/{id}/pending-commands` and acknowledge with
    `POST /rollouts/{id}/acks`.  Acks are validated against the persisted
    command (switch, step, digest, generation) and against the device's

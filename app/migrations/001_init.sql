@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS lease_ops (
 );
 
 -- Strictly increasing per-device generations, global across rollouts.
+-- Rows are permanent and must never be deleted: the counters have to
+-- survive acknowledged commands, completed rollouts, idle periods and
+-- service restarts so a device can always tell newer commands from older
+-- ones by their generation.
 CREATE TABLE IF NOT EXISTS device_state (
     switch_id                 TEXT PRIMARY KEY,
     last_issued_generation    BIGINT NOT NULL DEFAULT 0,

@@ -500,6 +500,11 @@ def advance(rollout_id: str, payload) -> dict:
                 "SELECT permutation FROM plans WHERE id = %s", (rollout["plan_id"],)
             ).fetchone()["permutation"]
             switch_id = permutation[step]
+            # Generations are strictly increasing per device for the whole
+            # lifetime of the database: the device_state row is permanent
+            # and is never deleted, so completed rollouts, acknowledged
+            # commands, idle periods and service restarts can never reset
+            # the counter.
             generation = conn.execute(
                 """
                 INSERT INTO device_state (switch_id, last_issued_generation, last_accepted_generation)
@@ -667,7 +672,6 @@ def submit_ack(rollout_id: str, payload) -> dict:
             )
             _record_event(conn, rollout_id, "ROLLOUT_COMPLETED", {"total_steps": rollout["total_steps"]})
             rollout_status = "completed"
-        _discard_idle_device_state(conn, cmd["switch_id"])
         return _ack_view(cmd, ack["accepted_at"], rollout_status, duplicate=False)
 
 
@@ -697,27 +701,6 @@ def pending_commands(switch_id: str) -> dict:
             (switch_id,),
         ).fetchall()
     return {"switch_id": switch_id, "commands": [_command_view(r) for r in rows]}
-
-
-def _discard_idle_device_state(conn, switch_id: str) -> None:
-    pending = conn.execute(
-        "SELECT 1 FROM commands WHERE switch_id = %s AND status = 'PENDING' LIMIT 1",
-        (switch_id,),
-    ).fetchone()
-    if pending is not None:
-        return
-    active_rollouts = conn.execute(
-        """
-        SELECT 1
-        FROM commands c
-        JOIN rollouts r ON r.id = c.rollout_id
-        WHERE c.switch_id = %s AND r.status = 'in_progress'
-        LIMIT 1
-        """,
-        (switch_id,),
-    ).fetchone()
-    if active_rollouts is None:
-        conn.execute("DELETE FROM device_state WHERE switch_id = %s", (switch_id,))
 
 
 # ---------------------------------------------------------------------------

@@ -47,7 +47,13 @@ def pool() -> ConnectionPool:
 
 
 def run_migrations() -> None:
-    """Apply pending SQL migrations exactly once across all replicas."""
+    """Apply pending SQL migrations exactly once across all replicas.
+
+    Migrations only create schema objects; they must never touch table
+    contents.  In particular the per-device generation counters in
+    ``device_state`` are permanent monotonic state -- deleting them here
+    (e.g. on every replica restart) would reset device generations.
+    """
     files = sorted(MIGRATIONS_DIR.glob("*.sql"))
     with pool().connection() as conn:
         conn.execute("SELECT pg_advisory_lock(%s)", (_MIGRATION_LOCK_ID,))
@@ -62,22 +68,6 @@ def run_migrations() -> None:
                     if statement:
                         conn.execute(statement)
             conn.commit()
-            _discard_idle_device_state(conn)
-            conn.commit()
         finally:
             conn.execute("SELECT pg_advisory_unlock(%s)", (_MIGRATION_LOCK_ID,))
             conn.commit()
-
-
-def _discard_idle_device_state(conn) -> None:
-    active = conn.execute(
-        "SELECT DISTINCT switch_id FROM commands WHERE status = 'PENDING'"
-    ).fetchall()
-    active_ids = [row[0] for row in active]
-    if active_ids:
-        conn.execute(
-            "DELETE FROM device_state WHERE NOT (switch_id = ANY(%s))",
-            (active_ids,),
-        )
-    else:
-        conn.execute("DELETE FROM device_state")
