@@ -1,0 +1,68 @@
+name: switch-migration
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: migration
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d migration"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api1:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/migration
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 15s
+
+  api2:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/migration
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${API_PORT_2:-8001}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 15s
+
+  # One-shot acceptance suite: runs the full pytest battery against both
+  # API replicas (which share the same database) and exits non-zero on
+  # any failure.
+  verify:
+    build: .
+    command: ["python", "-m", "pytest", "tests", "-q"]
+    environment:
+      API1_URL: http://api1:8000
+      API2_URL: http://api2:8000
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+
+volumes:
+  pgdata:
