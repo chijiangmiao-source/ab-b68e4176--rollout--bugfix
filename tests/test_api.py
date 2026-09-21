@@ -25,6 +25,7 @@ from conftest import (
     create_plan,
     create_rollout,
     drive_to_completion,
+    fresh_api,
     key,
     lease,
     make_plan_and_rollout,
@@ -517,6 +518,185 @@ class TestAdvance:
         # and it did not change state
         status = client.get(f"{api1}/rollouts/{rid1}").json()
         assert status["commands"][0]["status"] == "PENDING"
+
+
+# ---------------------------------------------------------------------------
+# device generation survives rollout completion and service restarts
+# ---------------------------------------------------------------------------
+
+class TestDeviceGenerationAcrossRollouts:
+    """A single switch may execute the same plan in several rollouts.
+
+    Its ``device_generation`` must keep increasing across rollouts, idle
+    periods and API restarts -- the switch uses it to tell new commands from
+    old ones.
+    """
+
+    @staticmethod
+    def _migration_topology(switch_id: str) -> dict:
+        # The ingress flips old-path -> new-path; both exit switches lead
+        # straight to DELIVER, so the only planned step is the ingress flip.
+        return topo_payload(
+            {
+                switch_id: ("old-path", "new-path"),
+                "old-path": ("DELIVER", "DELIVER"),
+                "new-path": ("DELIVER", "DELIVER"),
+            },
+            [switch_id],
+        )
+
+    def _create_plan(self, client, base, switch_id):
+        r = client.post(
+            f"{base}/plans",
+            json={
+                "idempotency_key": key(),
+                "topology": self._migration_topology(switch_id),
+            },
+        )
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["permutation"] == [switch_id]
+        assert body["status"] == "completed"
+        return body
+
+    def _run_first_rollout(self, client, base, plan, coordinator="coord-A"):
+        """Create rollout A, lease+advance, ack, complete.  Returns its command."""
+        rollout = create_rollout(client, base, plan["id"])
+        assert rollout.status_code == 201, rollout.text
+        rid = rollout.json()["id"]
+        epoch = lease(client, base, rid, coordinator, ttl=30).json()["epoch"]
+        op = key()
+        r = advance(client, base, rid, coordinator, epoch, op=op)
+        assert r.status_code == 200, r.text
+        cmd = r.json()["command"]
+        assert cmd["step"] == 0
+        assert cmd["switch_id"] == plan["permutation"][0]
+        assert cmd["device_generation"] == 1
+        # retrying the same advance op replays the *same* command id + generation
+        r2 = advance(client, base, rid, coordinator, epoch, op=op)
+        assert r2.status_code == 200
+        assert r2.json()["command"]["command_id"] == cmd["command_id"]
+        assert r2.json()["command"]["device_generation"] == 1
+        r = ack(client, base, rid, cmd)
+        assert r.status_code == 200, r.text
+        assert r.json()["rollout_status"] == "completed"
+        status = client.get(f"{base}/rollouts/{rid}").json()
+        assert status["status"] == "completed"
+        return rid, cmd
+
+    def test_sequential_rollouts_same_plan_across_replicas(self, client, api1, api2):
+        """A completes on api1; B (same plan) is driven via api2 -> gen 2."""
+        switch = f"edge-repeat-{uuid.uuid4().hex[:8]}"
+        plan = self._create_plan(client, api1, switch)
+
+        # rollout A via api1
+        rid_a, cmd_a = self._run_first_rollout(client, api1, plan, "coord-A")
+        assert cmd_a["device_generation"] == 1
+
+        # rollout B, same plan, leased/advanced through the *other* replica
+        rb = create_rollout(client, api2, plan["id"])
+        assert rb.status_code == 201, rb.text
+        rid_b = rb.json()["id"]
+        assert rid_b != rid_a
+        epoch_b = lease(client, api2, rid_b, "coord-B", ttl=30).json()["epoch"]
+        op_b = key()
+        r = advance(client, api2, rid_b, "coord-B", epoch_b, op=op_b)
+        assert r.status_code == 200, r.text
+        cmd_b = r.json()["command"]
+        assert cmd_b["device_generation"] == 2
+        assert cmd_b["command_id"] != cmd_a["command_id"]
+        assert cmd_b["switch_id"] == switch
+
+        # same advance op retried on either replica returns the original
+        # command id and generation (no extra issuance)
+        for base in (api2, api1):
+            r = advance(client, base, rid_b, "coord-B", epoch_b, op=op_b)
+            assert r.status_code == 200
+            assert r.json()["command"]["command_id"] == cmd_b["command_id"]
+            assert r.json()["command"]["device_generation"] == 2
+
+        # the switch can poll and acknowledge the second command
+        pending = client.get(f"{api1}/switches/{switch}/pending-commands").json()
+        assert [c["command_id"] for c in pending["commands"]] == [cmd_b["command_id"]]
+        r = ack(client, api1, rid_b, cmd_b)
+        assert r.status_code == 200
+        assert r.json()["rollout_status"] == "completed"
+
+        # the two consecutive commands carry generations [1, 2]
+        assert [cmd_a["device_generation"], cmd_b["device_generation"]] == [1, 2]
+
+        # each rollout's audit trail contains only its own create + command
+        for rid, cid in ((rid_a, cmd_a["command_id"]), (rid_b, cmd_b["command_id"])):
+            events = client.get(f"{api1}/rollouts/{rid}/audit").json()["events"]
+            created = [e for e in events if e["event_type"] == "COMMAND_CREATED"]
+            applied = [e for e in events if e["event_type"] == "COMMAND_APPLIED"]
+            assert len(created) == 1
+            assert len(applied) == 1
+            assert created[0]["payload"]["command_id"] == cid
+            assert applied[0]["payload"]["command_id"] == cid
+            assert client.get(f"{api1}/rollouts/{rid}").json()["status"] == "completed"
+
+        # a third rollout keeps climbing: generation 3
+        rc = create_rollout(client, api1, plan["id"]).json()
+        epoch_c = lease(client, api1, rc["id"], "coord-C", ttl=30).json()["epoch"]
+        cmd_c = advance(client, api1, rc["id"], "coord-C", epoch_c).json()["command"]
+        assert cmd_c["device_generation"] == 3
+        assert ack(client, api2, rc["id"], cmd_c).json()["rollout_status"] == "completed"
+
+    def test_generation_survives_api_restart(self, client, api1, api2):
+        """After A completes, a cold-started API instance must issue gen 2."""
+        switch = f"edge-repeat-{uuid.uuid4().hex[:8]}"
+        plan = self._create_plan(client, api1, switch)
+        rid_a, cmd_a = self._run_first_rollout(client, api1, plan, "coord-A")
+        assert cmd_a["device_generation"] == 1
+
+        # cold-start a completely fresh API process on the shared database
+        with fresh_api() as api3:
+            assert client.get(f"{api3}/health").status_code == 200
+            rb = create_rollout(client, api3, plan["id"])
+            assert rb.status_code == 201, rb.text
+            rid_b = rb.json()["id"]
+            epoch_b = lease(client, api3, rid_b, "coord-B", ttl=30).json()["epoch"]
+            op_b = key()
+            r = advance(client, api3, rid_b, "coord-B", epoch_b, op=op_b)
+            assert r.status_code == 200, r.text
+            cmd_b = r.json()["command"]
+            assert cmd_b["device_generation"] == 2
+            assert cmd_b["command_id"] != cmd_a["command_id"]
+
+            # retried advance (including from a different replica) stays put
+            for base in (api3, api2):
+                r = advance(client, base, rid_b, "coord-B", epoch_b, op=op_b)
+                assert r.status_code == 200
+                assert r.json()["command"]["command_id"] == cmd_b["command_id"]
+                assert r.json()["command"]["device_generation"] == 2
+
+            # second command is queryable and ackable through the other replica
+            pending = client.get(f"{api2}/switches/{switch}/pending-commands").json()
+            assert [c["command_id"] for c in pending["commands"]] == [cmd_b["command_id"]]
+            r = ack(client, api2, rid_b, cmd_b)
+            assert r.status_code == 200
+            assert r.json()["rollout_status"] == "completed"
+
+        assert [cmd_a["device_generation"], cmd_b["device_generation"]] == [1, 2]
+        # clean, per-rollout audit trails
+        for rid, cid in ((rid_a, cmd_a["command_id"]), (rid_b, cmd_b["command_id"])):
+            events = client.get(f"{api1}/rollouts/{rid}/audit").json()["events"]
+            assert [e["event_type"] for e in events].count("COMMAND_CREATED") == 1
+            assert [e["event_type"] for e in events].count("COMMAND_APPLIED") == 1
+            assert all(
+                e["payload"].get("command_id") == cid
+                for e in events
+                if e["event_type"] in ("COMMAND_CREATED", "COMMAND_APPLIED")
+            )
+
+        # restart again, then another rollout: generation keeps climbing
+        with fresh_api() as api3:
+            rd = create_rollout(client, api3, plan["id"]).json()
+            epoch_d = lease(client, api3, rd["id"], "coord-D", ttl=30).json()["epoch"]
+            cmd_d = advance(client, api3, rd["id"], "coord-D", epoch_d).json()["command"]
+            assert cmd_d["device_generation"] == 3
+            assert ack(client, api3, rd["id"], cmd_d).json()["rollout_status"] == "completed"
 
 
 # ---------------------------------------------------------------------------

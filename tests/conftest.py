@@ -6,15 +6,29 @@ processes, not just inside one.
 """
 from __future__ import annotations
 
+import contextlib
 import os
+import socket
+import subprocess
+import sys
+import tempfile
 import time
 import uuid
+from pathlib import Path
 
 import httpx
 import pytest
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 API1 = os.environ.get("API1_URL", "http://localhost:8000")
 API2 = os.environ.get("API2_URL", "http://localhost:8001")
+
+# A freshly started API process connects to the same database as the two
+# long-running replicas.  Used by restart-recovery tests.
+TEST_DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://postgres:postgres@db:5432/migration"
+)
 
 WAIT_TIMEOUT = float(os.environ.get("API_WAIT_TIMEOUT", "90"))
 
@@ -157,3 +171,52 @@ def drive_to_completion(client: httpx.Client, base: str, rid: str, coordinator: 
         if r.json()["rollout_status"] == "completed":
             return
     raise AssertionError("rollout did not complete")
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+@contextlib.contextmanager
+def fresh_api(database_url: str | None = None):
+    """Run a brand-new API process against the shared database.
+
+    Simulates a service (re)start / a cold third replica: a clean process
+    with no in-process state of any kind.  Yields the base URL of the
+    short-lived instance and tears it down on exit.
+    """
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    env = dict(os.environ)
+    env["DATABASE_URL"] = database_url or TEST_DATABASE_URL
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    log = tempfile.NamedTemporaryFile(prefix="fresh-api-", suffix=".log", delete=False)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "app.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        cwd=str(REPO_ROOT),
+        env=env,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _wait_for(base)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+        log.close()

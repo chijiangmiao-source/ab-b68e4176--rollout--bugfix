@@ -500,6 +500,14 @@ def advance(rollout_id: str, payload) -> dict:
                 "SELECT permutation FROM plans WHERE id = %s", (rollout["plan_id"],)
             ).fetchone()["permutation"]
             switch_id = permutation[step]
+            # Device-global generation: strictly increasing across *all*
+            # rollouts for the switch.  The counter row is created once and
+            # never deleted -- not after acks, not on rollout completion, not
+            # while idle and not on restart -- so re-running a migration plan
+            # for the same device always observes a higher generation.  The
+            # UPSERT takes a row lock on the device row, so concurrent first
+            # issuances from different rollouts/replicas serialise here and
+            # receive consecutive generations.
             generation = conn.execute(
                 """
                 INSERT INTO device_state (switch_id, last_issued_generation, last_accepted_generation)
@@ -667,7 +675,6 @@ def submit_ack(rollout_id: str, payload) -> dict:
             )
             _record_event(conn, rollout_id, "ROLLOUT_COMPLETED", {"total_steps": rollout["total_steps"]})
             rollout_status = "completed"
-        _discard_idle_device_state(conn, cmd["switch_id"])
         return _ack_view(cmd, ack["accepted_at"], rollout_status, duplicate=False)
 
 
@@ -697,27 +704,6 @@ def pending_commands(switch_id: str) -> dict:
             (switch_id,),
         ).fetchall()
     return {"switch_id": switch_id, "commands": [_command_view(r) for r in rows]}
-
-
-def _discard_idle_device_state(conn, switch_id: str) -> None:
-    pending = conn.execute(
-        "SELECT 1 FROM commands WHERE switch_id = %s AND status = 'PENDING' LIMIT 1",
-        (switch_id,),
-    ).fetchone()
-    if pending is not None:
-        return
-    active_rollouts = conn.execute(
-        """
-        SELECT 1
-        FROM commands c
-        JOIN rollouts r ON r.id = c.rollout_id
-        WHERE c.switch_id = %s AND r.status = 'in_progress'
-        LIMIT 1
-        """,
-        (switch_id,),
-    ).fetchone()
-    if active_rollouts is None:
-        conn.execute("DELETE FROM device_state WHERE switch_id = %s", (switch_id,))
 
 
 # ---------------------------------------------------------------------------

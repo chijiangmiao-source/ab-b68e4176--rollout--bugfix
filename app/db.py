@@ -62,22 +62,6 @@ def run_migrations() -> None:
                     if statement:
                         conn.execute(statement)
             conn.commit()
-            _discard_idle_device_state(conn)
-            conn.commit()
         finally:
             conn.execute("SELECT pg_advisory_unlock(%s)", (_MIGRATION_LOCK_ID,))
             conn.commit()
-
-
-def _discard_idle_device_state(conn) -> None:
-    active = conn.execute(
-        "SELECT DISTINCT switch_id FROM commands WHERE status = 'PENDING'"
-    ).fetchall()
-    active_ids = [row[0] for row in active]
-    if active_ids:
-        conn.execute(
-            "DELETE FROM device_state WHERE NOT (switch_id = ANY(%s))",
-            (active_ids,),
-        )
-    else:
-        conn.execute("DELETE FROM device_state")
